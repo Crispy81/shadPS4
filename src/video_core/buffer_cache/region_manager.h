@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <utility>
 
 #include "common/adaptive_mutex.h"
@@ -83,6 +84,10 @@ public:
     template <StateOp cpu_op, StateOp gpu_op, bool locked = true>
     void ChangeRegionState(u64 offset, u64 size) {
         auto bounds = GetBounds(offset, size);
+        std::unique_lock guard{mutex, std::defer_lock};
+        if constexpr (locked) {
+            guard.lock();
+        }
         if (!HasEffect<cpu_op, gpu_op>(bounds)) {
             return;
         }
@@ -90,9 +95,6 @@ public:
         RegionBits write_prot;
         RegionBits read_prot;
         Bounds watcher_bounds = MIN_BOUNDS;
-        if constexpr (locked) {
-            mutex.lock();
-        }
         IterateWords(bounds, [&](u64 index, u64 mask) {
             update_watchers |= UpdateProtection<cpu_op, gpu_op>(write_prot, read_prot,
                                                                 watcher_bounds, index, mask);
@@ -106,14 +108,15 @@ public:
         }
         IterateWords(bounds,
                      [&](u64 index, u64 mask) { UpdateState<cpu_op, gpu_op>(index, mask); });
-        if constexpr (locked) {
-            mutex.unlock();
-        }
     }
 
     template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true>
     void ForEachModifiedRange(u64 offset, s64 size, auto&& func) {
         auto bounds = GetBounds(offset, size);
+        std::unique_lock guard{mutex, std::defer_lock};
+        if constexpr (locked) {
+            guard.lock();
+        }
         if (!HasEffect<cpu_op, gpu_op, type>(bounds)) {
             return;
         }
@@ -124,9 +127,6 @@ public:
         u64 start_page{};
         u64 end_page{};
         Bounds watcher_bounds = MIN_BOUNDS;
-        if constexpr (locked) {
-            mutex.lock();
-        }
         IterateWords(bounds, [&](u64 index, u64 mask) {
             const u64 base_page = index * PAGES_PER_WORD;
             const u64 word = state[index] & mask;
@@ -157,9 +157,6 @@ public:
         }
         IterateWords(bounds,
                      [&](u64 index, u64 mask) { UpdateState<cpu_op, gpu_op>(index, mask); });
-        if constexpr (locked) {
-            mutex.unlock();
-        }
     }
 
     template <Type type>

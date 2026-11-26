@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <mutex>
 #include <vector>
 #include "common/object_pool.h"
 #include "common/spin_lock.h"
@@ -22,68 +25,75 @@ class MultiLevelPageTable final {
 
 public:
     explicit MultiLevelPageTable(size_t chunk_size = 64)
-        : top_level{1ULL << L1_BITS, nullptr}, page_alloc{chunk_size} {}
+        : top_level(1ULL << L1_BITS), page_alloc{chunk_size} {}
 
     ~MultiLevelPageTable() noexcept = default;
 
     [[nodiscard]] Entry* find(size_t page) {
         const size_t l1_page = page >> L2_BITS;
         const size_t l2_page = page & (NUM_L1_ENTRIES - 1);
-        if (!top_level[l1_page]) [[unlikely]] {
-            return nullptr;
-        }
-        return &(*top_level[l1_page])[l2_page];
+        auto* block = top_level[l1_page].load(std::memory_order_acquire);
+        return block ? &(*block)[l2_page] : nullptr;
     }
 
     [[nodiscard]] const Entry* find(size_t page) const {
         const size_t l1_page = page >> L2_BITS;
         const size_t l2_page = page & (NUM_L1_ENTRIES - 1);
-        if (!top_level[l1_page]) [[unlikely]] {
-            return nullptr;
-        }
-        return &(*top_level[l1_page])[l2_page];
+        auto* block = top_level[l1_page].load(std::memory_order_acquire);
+        return block ? &(*block)[l2_page] : nullptr;
     }
 
     void reserve(size_t start_page, size_t end_page) {
         const size_t start_l1_page = start_page >> L2_BITS;
         const size_t end_l1_page = end_page >> L2_BITS;
         for (size_t l1_page = start_l1_page; l1_page <= end_l1_page; ++l1_page) {
-            if (!top_level[l1_page]) {
-                top_level[l1_page] = page_alloc.Create();
-            }
+            GetOrCreate(l1_page);
         }
     }
 
     [[nodiscard]] const Entry& operator[](size_t page) const {
         const size_t l1_page = page >> L2_BITS;
         const size_t l2_page = page & (NUM_L1_ENTRIES - 1);
-        if (NULL_CHECK && !top_level[l1_page]) [[unlikely]] {
-            top_lock.lock();
-            if (!top_level[l1_page]) {
-                top_level[l1_page] = page_alloc.Create();
+        auto* block = top_level[l1_page].load(std::memory_order_acquire);
+        if constexpr (NULL_CHECK) {
+            if (!block) [[unlikely]] {
+                block = GetOrCreate(l1_page);
             }
-            top_lock.unlock();
         }
-        return (*top_level[l1_page])[l2_page];
+        return (*block)[l2_page];
     }
 
     [[nodiscard]] Entry& operator[](size_t page) {
         const size_t l1_page = page >> L2_BITS;
         const size_t l2_page = page & (NUM_L1_ENTRIES - 1);
-        if (NULL_CHECK && !top_level[l1_page]) [[unlikely]] {
-            top_lock.lock();
-            if (!top_level[l1_page]) {
-                top_level[l1_page] = page_alloc.Create();
+        auto* block = top_level[l1_page].load(std::memory_order_acquire);
+        if constexpr (NULL_CHECK) {
+            if (!block) [[unlikely]] {
+                block = GetOrCreate(l1_page);
             }
-            top_lock.unlock();
         }
-        return (*top_level[l1_page])[l2_page];
+        return (*block)[l2_page];
     }
 
 private:
-    std::vector<L1Page*> top_level{};
+    // A block is published once and remains alive until table destruction.
+    L1Page* GetOrCreate(size_t index) const {
+        auto* block = top_level[index].load(std::memory_order_acquire);
+        if (block) {
+            return block;
+        }
+        std::lock_guard guard{top_lock};
+        block = top_level[index].load(std::memory_order_relaxed);
+        if (!block) {
+            block = page_alloc.Create();
+            top_level[index].store(block, std::memory_order_release);
+        }
+        return block;
+    }
+
+    mutable std::vector<std::atomic<L1Page*>> top_level;
     mutable Common::SpinLock top_lock{};
-    Common::ObjectPool<L1Page> page_alloc;
+    mutable Common::ObjectPool<L1Page> page_alloc;
 };
 
 } // namespace Common
