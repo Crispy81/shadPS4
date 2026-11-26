@@ -115,8 +115,9 @@ struct PageManager::Impl {
         end = std::min(end, VAddr{1} << ADDRESS_BITS) - 1;
         const size_t start_page = begin >> PM_PAGE_BITS;
         const size_t end_page = end >> PM_PAGE_BITS;
-        cached_pages.reserve(start_page, end_page);
+        // Publish the lock blocks before exposing their corresponding page states.
         locks.reserve(start_page, end_page);
+        cached_pages.reserve(start_page, end_page);
     }
 
     // Bounded, sharded history. Do not log every page update or change watcher semantics.
@@ -199,6 +200,9 @@ struct PageManager::Impl {
 
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op,
                             std::source_location caller) {
+        if (size == 0) {
+            return;
+        }
         const u64 page_start = addr >> PM_PAGE_BITS;
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
 
@@ -222,14 +226,13 @@ struct PageManager::Impl {
             LOG_WARNING(Render,
                         "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
                         aligned_addr, aligned_end);
-            EnsurePages(aligned_addr, aligned_end);
         }
+        // Sparse buffer/image ranges can cross a not-yet-registered page-table block.
+        // Never silently skip a watcher transition.
+        EnsurePages(aligned_addr, aligned_end);
 
         for (u64 page = page_start; page != page_end; ++page) {
-            PageState* state = cached_pages.find(page);
-            if (!state) {
-                continue;
-            }
+            auto* state = &cached_pages[page];
 
             locks[page].lock();
 
@@ -266,9 +269,7 @@ struct PageManager::Impl {
         release_pending();
 
         for (u64 page = page_start; page != page_end; ++page) {
-            if (auto* lock = locks.find(page)) {
-                lock->unlock();
-            }
+            locks[page].unlock();
         }
     }
 
@@ -279,6 +280,21 @@ struct PageManager::Impl {
         const u64 base_page = base_addr >> PM_PAGE_BITS;
         const u64 page_start = bounds.start_word * PAGES_PER_WORD + bounds.start_page;
         const u64 page_end = bounds.end_word * PAGES_PER_WORD + bounds.end_page + 1;
+
+        // RegionManager commits its CPU/GPU bit transitions after this call. If we skip
+        // pages whose table block does not exist, it believes a watcher was installed
+        // even though no counter was updated. Sparse buffer uploads may legitimately
+        // span these blocks before guest memory is mapped there.
+        const VAddr begin_addr = (base_page + page_start) << PM_PAGE_BITS;
+        const VAddr end_addr = (base_page + page_end) << PM_PAGE_BITS;
+        ASSERT_MSG(begin_addr < end_addr && end_addr <= (VAddr{1} << ADDRESS_BITS),
+                   "Invalid watcher range {:#x} - {:#x}", begin_addr, end_addr);
+        if (!cached_pages.find(base_page + page_start) ||
+            !cached_pages.find(base_page + page_end - 1)) {
+            LOG_INFO(Render, "WATCHER_DIAG allocating missing page state for region [{:#x},{:#x})",
+                     begin_addr, end_addr);
+        }
+        EnsurePages(begin_addr, end_addr);
 
         Core::MemoryPermission perms{};
         u64 range_begin = base_page + page_start;
@@ -294,10 +310,7 @@ struct PageManager::Impl {
         };
 
         for (u64 page = page_start; page != page_end; ++page) {
-            PageState* state = cached_pages.find(base_page + page);
-            if (!state) {
-                continue;
-            }
+            auto* state = &cached_pages[base_page + page];
 
             locks[base_page + page].lock();
 
@@ -339,9 +352,7 @@ struct PageManager::Impl {
         release_pending();
 
         for (u64 page = page_start; page != page_end; ++page) {
-            if (auto* lock = locks.find(base_page + page)) {
-                lock->unlock();
-            }
+            locks[base_page + page].unlock();
         }
     }
 
