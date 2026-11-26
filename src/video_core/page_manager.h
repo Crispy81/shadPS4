@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <source_location>
 #include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"
@@ -39,12 +40,14 @@ public:
     void OnGpuUnmap(VAddr address, size_t size);
 
     /// Updates watches in the pages touching the specified region.
-    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
+    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op,
+                            std::source_location caller = std::source_location::current()) const;
 
     /// Updates watches in the pages touching the inclusive bounds using a mask.
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,
-                                     PageOp write_op, PageOp read_op) const;
+                                     PageOp write_op, PageOp read_op,
+                                     std::source_location caller = std::source_location::current()) const;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {

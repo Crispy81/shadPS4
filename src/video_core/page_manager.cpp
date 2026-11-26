@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -115,7 +119,86 @@ struct PageManager::Impl {
         locks.reserve(start_page, end_page);
     }
 
-    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
+    // Bounded, sharded history. Do not log every page update or change watcher semantics.
+    struct WatcherEvent {
+        u64 page{};
+        VAddr range_begin{};
+        VAddr range_end{};
+        std::source_location caller{};
+        size_t thread{};
+        int write_before{};
+        int read_before{};
+        int write_delta{};
+        int read_delta{};
+        bool valid{};
+    };
+
+    struct WatcherHistory {
+        std::mutex mutex;
+        std::array<WatcherEvent, 16> events{};
+        size_t next{};
+    };
+
+    static constexpr size_t HISTORY_BUCKETS = 4096;
+    std::array<WatcherHistory, HISTORY_BUCKETS> watcher_history{};
+
+    void CheckWatcherUpdate(u64 page, VAddr begin, VAddr end, const PageState& state,
+                            PageOp write_op, bool update_write, PageOp read_op,
+                            bool update_read, std::source_location caller) {
+        const int dw = update_write ? static_cast<int>(write_op) : 0;
+        const int dr = update_read ? static_cast<int>(read_op) : 0;
+        if (dw == 0 && dr == 0) {
+            return;
+        }
+        const int wb = state.num_write_watchers;
+        const int rb = state.num_read_watchers;
+        const bool bad = wb + dw < 0 || wb + dw > 255 || rb + dr < 0 || rb + dr > 1;
+        const WatcherEvent current{
+            .page = page,
+            .range_begin = begin,
+            .range_end = end,
+            .caller = caller,
+            .thread = std::hash<std::thread::id>{}(std::this_thread::get_id()),
+            .write_before = wb,
+            .read_before = rb,
+            .write_delta = dw,
+            .read_delta = dr,
+            .valid = true,
+        };
+        // The caller holds the page lock. The bucket lock additionally handles hash collisions.
+        auto& history = watcher_history[(page ^ (page >> 12)) % HISTORY_BUCKETS];
+        if (!bad) {
+            std::lock_guard guard{history.mutex};
+            history.events[history.next] = current;
+            history.next = (history.next + 1) % history.events.size();
+            return;
+        }
+        const auto [snapshot, next] = [&] {
+            std::lock_guard guard{history.mutex};
+            return std::pair{history.events, history.next};
+        }();
+        // Log retained events for the failing page, in chronological order.
+        for (size_t i = 0; i < snapshot.size(); ++i) {
+            const auto& e = snapshot[(next + i) % snapshot.size()];
+            if (!e.valid || e.page != page) {
+                continue;
+            }
+            LOG_ERROR(Render,
+                      "WATCHER_DIAG history page={:#x} range=[{:#x},{:#x}) thread={:#x} "
+                      "write={} delta={} read={} delta={} caller={}:{} {}",
+                      e.page << PM_PAGE_BITS, e.range_begin, e.range_end, e.thread,
+                      e.write_before, e.write_delta, e.read_before, e.read_delta,
+                      e.caller.file_name(), e.caller.line(), e.caller.function_name());
+        }
+        ASSERT_MSG(!bad,
+                   "WATCHER_DIAG invalid watcher update page={:#x} range=[{:#x},{:#x}) "
+                   "thread={:#x} write={} delta={} read={} delta={} caller={}:{} {}",
+                   page << PM_PAGE_BITS, begin, end, current.thread, wb, dw, rb, dr,
+                   caller.file_name(), caller.line(), caller.function_name());
+    }
+
+    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op,
+                            std::source_location caller) {
         const u64 page_start = addr >> PM_PAGE_BITS;
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
 
@@ -156,6 +239,8 @@ struct PageManager::Impl {
             }
 
             // Apply the change to the page state
+            CheckWatcherUpdate(page, addr, addr + size, *state, write_op, true,
+                               PageOp::None, false, caller);
             const auto new_perms = state->Update(write_op);
             if (new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
@@ -189,7 +274,8 @@ struct PageManager::Impl {
 
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,
-                                     PageOp write_op, PageOp read_op) {
+                                     PageOp write_op, PageOp read_op,
+                                     std::source_location caller) {
         const u64 base_page = base_addr >> PM_PAGE_BITS;
         const u64 page_start = bounds.start_word * PAGES_PER_WORD + bounds.start_page;
         const u64 page_end = bounds.end_word * PAGES_PER_WORD + bounds.end_page + 1;
@@ -223,6 +309,9 @@ struct PageManager::Impl {
             // Apply the change to the page state
             const bool update_write = write_op != PageOp::None && write_mask.GetPage(page);
             const bool update_read = read_op != PageOp::None && read_mask.GetPage(page);
+            CheckWatcherUpdate(base_page + page, base_addr + (page_start << PM_PAGE_BITS),
+                               base_addr + (page_end << PM_PAGE_BITS), *state,
+                               write_op, update_write, read_op, update_read, caller);
             const auto new_perms = state->Update(write_op, update_write, read_op, update_read);
 
             if (new_perms != perms) [[unlikely]] {
@@ -471,15 +560,17 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
 }
 
-void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const {
-    impl->UpdatePageWatchers(addr, size, write_op);
+void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op,
+                                     std::source_location caller) const {
+    impl->UpdatePageWatchers(addr, size, write_op, caller);
 }
 
 void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                               const RegionBits& write_mask,
                                               const RegionBits& read_mask, PageOp write_op,
-                                              PageOp read_op) const {
-    impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op);
+                                              PageOp read_op, std::source_location caller) const {
+    impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op,
+                                      caller);
 }
 
 } // namespace VideoCore
